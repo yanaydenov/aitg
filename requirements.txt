@@ -1,0 +1,6 @@
+openai>=1.30
+telethon>=1.36
+httpx>=0.27
+trafilatura>=1.12
+ddgs>=6.2
+python-dotenv>=1.0

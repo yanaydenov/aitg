@@ -1,0 +1,16 @@
+# окружение
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# секреты и данные
+.env
+*.session
+*.session-journal
+aitg.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
