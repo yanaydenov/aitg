@@ -66,6 +66,20 @@ async def on_add(event: events.NewMessage.Event):
     log.info("added user %s to whitelist", user_id)
 
 
+@tg.on(events.NewMessage(pattern=r"(?is)^\s*\.remove\s+(\d+)"))
+async def on_remove(event: events.NewMessage.Event):
+    """Удаляет пользователя из whitelist (только владелец)."""
+    if event.sender_id != OWNER_ID:
+        return
+    if not event.is_private:
+        return
+
+    user_id = int(event.pattern_match.group(1))
+    memory.whitelist_remove(user_id)
+    await event.respond(f"❌ удалил {user_id} из whitelist")
+    log.info("removed user %s from whitelist", user_id)
+
+
 @tg.on(events.NewMessage(pattern=rf"(?is)^\s*{PREFIX}(\b|\s|$)(.*)"))
 async def on_ai(event: events.NewMessage.Event):
     if not _bot_enabled:
@@ -202,11 +216,30 @@ async def on_ai(event: events.NewMessage.Event):
     log.info("on_ai: done msg_id=%s answer_len=%s images=%d", msg.id, len(answer), len(ctx.pending_images))
 
 
+async def _reminder_loop():
+    """Фоновая задача: каждые 30 сек проверяет и отправляет напоминания."""
+    import time as _time
+    while True:
+        await asyncio.sleep(30)
+        try:
+            due = memory.get_due_reminders(int(_time.time()))
+            for r in due:
+                try:
+                    await tg.send_message(r["chat_id"], f"⏰ Напоминание: {r['text']}")
+                    memory.mark_reminder_done(r["id"])
+                    log.info("reminder %s fired in chat %s", r["id"], r["chat_id"])
+                except Exception as e:
+                    log.error("reminder send failed: %s", e)
+        except Exception as e:
+            log.error("reminder loop error: %s", e)
+
+
 async def main():
     await tg.start()
     me = await tg.get_me()
     log.info("logged in as @%s (id=%s). owner_id=%s", me.username, me.id, OWNER_ID)
     log.info("listening for prefix %r. private=%s", PREFIX, ALLOW_PRIVATE)
+    asyncio.create_task(_reminder_loop())
     await tg.run_until_disconnected()
 
 

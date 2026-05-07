@@ -53,6 +53,18 @@ async def _extract_frames(video: Path, n: int) -> list[Path]:
     return frames
 
 
+async def _convert_to_mp3(audio: Path) -> Path | None:
+    """Конвертирует аудио в mp3 через ffmpeg."""
+    out = audio.with_suffix(".mp3")
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-i", str(audio), "-ar", "16000", "-ac", "1",
+        "-b:a", "64k", str(out),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    await proc.wait()
+    return out if out.exists() else None
+
+
 async def message_to_image_parts(msg: Message) -> list[dict]:
     """Превращает медиа из сообщения в openai-style image_url content parts."""
     if not msg or not msg.media:
@@ -73,5 +85,10 @@ async def message_to_image_parts(msg: Message) -> list[dict]:
         ]
     if mime.startswith("image/") or p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
         return [{"type": "image_url", "image_url": {"url": _b64_data_url(p)}}]
+    if mime.startswith("audio/") or p.suffix.lower() in {".ogg", ".oga", ".mp3", ".wav", ".m4a", ".opus", ".flac"}:
+        mp3 = await _convert_to_mp3(p)
+        if mp3:
+            b = base64.b64encode(mp3.read_bytes()).decode()
+            return [{"type": "input_audio", "input_audio": {"data": b, "format": "mp3"}}]
     # неизвестный тип — игнорим
     return []

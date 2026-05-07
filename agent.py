@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 
 from openai import OpenAI
 
@@ -91,6 +92,7 @@ def _system_prompt(ctx: tools.ToolCtx) -> str:
         "Отвечай кратко, по делу, на языке последнего вопроса.",
         "Используй тулы агрессивно: для свежей инфы — web_search/fetch_url.",
         "ВАЖНО: read_chat_history читает ТОЛЬКО ТЕКУЩИЙ чат. Используй его если просят 'прочитай чат', 'саммари', 'последние сообщения' БЕЗ указания другого чата.",
+        "Если спрашивают про сообщения за период — используй read_other_chat с since_hours: 'сегодня'=24, 'вчера'=48, '2 дня'=48, '3 дня'=72, 'неделя'=168. Всегда ставь limit=200 при таких запросах. Если результат пустой — честно скажи что за этот период сообщений не было, и укажи ts последнего сообщения из обычного вызова без since_hours.",
         "СТРОГО: если просят рандомное/случайное сообщение из чатов — вызови list_all_chats(), выбери случайный чат, вызови read_other_chat(chat_id, limit=100), выбери случайное сообщение из результата и процитируй ДОСЛОВНО с указанием чата и автора. НИКОГДА не придумывай текст сообщений — только реальные данные из тулов. Если просят 'ещё' — снова вызывай read_other_chat на другом чате.",
         "Если в запросе названо имя ДРУГОГО чата/группы/канала (любое слово/фраза которая выглядит как имя: 'охуенко чат', 'scared cat clan', 'наша группа', 'мама', 'работа', 'сони' и т.п.) — СНАЧАЛА вызови list_all_chats() чтобы получить список всех чатов, САМОСТОЯТЕЛЬНО выбери подходящий по названию, получи id, затем read_other_chat(chat_id, limit). find_chat можно использовать как fallback если list_all_chats не помог. НЕ используй read_link_preview - он работает только для публичных ссылок к которым есть доступ. Если нужно взять фотки из другого чата для генерации/редактирования — вызови read_other_chat с include_media=true чтобы получить image_urls.",
         "Если вопрос про погоду/курс/крипту — соответствующие тулы.",
@@ -98,6 +100,7 @@ def _system_prompt(ctx: tools.ToolCtx) -> str:
         "Если просят 'нарисуй', 'сгенерируй картинку' БЕЗ фото — вызови generate_image с описанием. Если просят 'сделай из этого', 'переделай', 'исправь', 'замени', 'отредактируй' И приложили фото — это РЕДАКТИРОВАНИЕ изображения: вызови generate_image(prompt='инструкция что именно изменить в референсном изображении на английском, например turn this sandwich into a gourmet version with more ingredients'). ВАЖНО: если пользователь приложил фото (в сообщении или реплае) — они автоматически передадутся как референсы, НЕ нужно описывать внешность людей словами. НЕ додумывай детали которых нет в запросе пользователя - используй только то что он сказал. Если запрос неясен - спроси уточнение. Картинка сама отправится в чат.",
         "ПАМЯТЬ: у тебя есть контекст последних ~10 сообщений этого чата. Если пользователь просит 'запомни', 'не забудь', 'это важно' или говорит личные факты (имена родственников/друзей, отношения, предпочтения, важные договорённости) — ОБЯЗАТЕЛЬНО вызови memory_remember(key='короткое описание', value='детали', scope='global' если это про владельца в целом, или 'chat' если специфично для чата). Если речь идёт о КОНКРЕТНОМ ЧЕЛОВЕКЕ по его telegram ID (например 'запомни что 123456 это соня', '123456 моя девушка') — используй user_remember(user_id, key, value). НЕ пиши 'запомнил' текстом - вызови тула. Проактивно используй memory_recall/memory_list и user_recall/user_list если видишь что вопрос требует ранее сохранённой инфы.",
         f"Текущий chat_id: {ctx.chat_id}. is_owner={ctx.is_owner}.",
+        f"Сейчас: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (UTC+5 = {datetime.now(timezone.utc).strftime('%Y-%m-%d')} {(datetime.now(timezone.utc).hour + 5) % 24:02d}:{datetime.now(timezone.utc).strftime('%M')}). Учитывай это при ответах про 'сегодня', 'вчера', 'сейчас'. Если читаешь сообщения из чата — проверяй их timestamp и говори когда они были написаны.",
     ]
     # добавляем данные текущего отправителя
     if ctx.trigger_msg and ctx.trigger_msg.sender_id:
@@ -224,9 +227,10 @@ def _run_sync(
     if user_text:
         user_content.append({"type": "text", "text": sender_tag + user_text})
     for p in image_parts:
-        url = p.get("image_url", {}).get("url", "")
-        if url:
-            user_content.append({"type": "image_url", "image_url": {"url": url}})
+        if p.get("type") == "input_audio":
+            user_content.append(p)
+        elif p.get("image_url", {}).get("url"):
+            user_content.append({"type": "image_url", "image_url": p["image_url"]})
     if not user_content:
         user_content.append({"type": "text", "text": sender_tag + "Опиши/проанализируй медиа."})
 
@@ -246,6 +250,7 @@ def _run_sync(
             tools=_oa_tools(),
             tool_choice="auto",
             temperature=0.7,
+            max_tokens=8192,
         )
         if not getattr(response, "choices", None):
             err = getattr(response, "error", None) or response.model_dump()
@@ -268,14 +273,18 @@ def _run_sync(
                     continue
                 final = clean
             # упрощённый текст user для истории (с тегом отправителя)
-            _history[ctx.chat_id].append({"role": "user", "content": sender_tag + (user_text or "(медиа)")})
+            user_log = sender_tag + (user_text or "(медиа)")
+            _history[ctx.chat_id].append({"role": "user", "content": user_log})
             _history[ctx.chat_id].append({"role": "assistant", "content": final})
+            memory.log_message(ctx.chat_id, "user", user_log)
+            memory.log_message(ctx.chat_id, "assistant", final)
             return final
 
         # добавляем ответ модели в историю
         messages.append(msg)
 
         # выполняем все tool_calls
+        vision_before = len(ctx.pending_vision)
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
             log.info("tool %s(%s) calling...", tc.function.name, args)
@@ -289,5 +298,13 @@ def _run_sync(
                 "tool_call_id": tc.id,
                 "content": result,
             })
+
+        # если тул добавил изображения в pending_vision — передаём их модели
+        new_vision = ctx.pending_vision[vision_before:]
+        if new_vision:
+            vision_parts = [{"type": "text", "text": "Изображения от тулов:"}]
+            for url in new_vision:
+                vision_parts.append({"type": "image_url", "image_url": {"url": url}})
+            messages.append({"role": "user", "content": vision_parts})
 
     return "(превышен лимит итераций tool-loop)"

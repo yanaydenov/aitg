@@ -42,12 +42,15 @@ class ToolCtx:
     loop: Optional[asyncio.AbstractEventLoop] = None
     pending_images: list = None  # type: ignore
     input_images: list = None  # type: ignore
+    pending_vision: list = None  # type: ignore  # data URLs для передачи модели как vision
 
     def __post_init__(self):
         if self.pending_images is None:
             self.pending_images = []
         if self.input_images is None:
             self.input_images = []
+        if self.pending_vision is None:
+            self.pending_vision = []
 
 
 _ctx: contextvars.ContextVar[ToolCtx] = contextvars.ContextVar("aitg_ctx")
@@ -432,23 +435,31 @@ def search_messages(query: str, chat_id: int | None = None, limit: int = 20) -> 
     return json.dumps(res, ensure_ascii=False)
 
 
-def read_other_chat(chat_id: int, limit: int = 50, include_media: bool = False) -> str:
-    """Читает последние limit сообщений из конкретного чата по его id (получи id через find_chat). Возвращает JSON [{from,text,ts,has_media}]. Если include_media=true, включает список image_urls из сообщений с медиа."""
+def read_other_chat(chat_id: int, limit: int = 50, include_media: bool = False, since_hours: int | None = None) -> str:
+    """Читает последние limit сообщений из конкретного чата по его id. Возвращает JSON [{from,text,ts,has_media}] от старых к новым. since_hours=N — только за последние N часов (например since_hours=24 = за сегодня). Для вопросов 'что сегодня/недавно' используй since_hours=24 и limit=200."""
     ctx = _ctx_get()
     try:
         chat_id = int(chat_id)
         limit = int(limit)
     except (TypeError, ValueError):
         return "ERROR: chat_id и limit должны быть числами"
-    limit = max(1, min(limit, 200))
+    limit = max(1, min(limit, 500))
 
     async def _run():
+        import datetime as _dt
         msgs = []
         raw = []
         sender_ids: set[int] = set()
+        min_date = None
+        if since_hours is not None:
+            min_date = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=int(since_hours))
         async for m in ctx.tg.iter_messages(chat_id, limit=limit):
             if not (m.text or m.message) and not m.media:
                 continue
+            if min_date and m.date:
+                msg_date = m.date if m.date.tzinfo else m.date.replace(tzinfo=_dt.timezone.utc)
+                if msg_date < min_date:
+                    break
             raw.append(m)
             if m.sender_id:
                 sender_ids.add(m.sender_id)
@@ -629,25 +640,22 @@ def get_user_profile(user_id_or_username: str) -> str:
             "status": str(getattr(entity, "status", None)) if hasattr(entity, "status") else None,
         }
 
-        # аватарка
-        avatar_b64 = None
+        # аватарка — скачиваем, кодируем в base64 для vision и добавляем в pending_images для отправки
         try:
-            photos = await ctx.tg.get_profile_photos(entity, limit=1)
-            if photos:
-                photo = photos[0]
-                # скачиваем аватарку
-                import io
-                from telethon.tl.types import InputPeerUser
-
-                file = await ctx.tg.download_profile_photo(entity, file=io.BytesIO())
-                if file:
-                    import base64
-                    avatar_b64 = base64.b64encode(file.getvalue()).decode()
+            import tempfile, pathlib, base64 as _b64
+            tmp = pathlib.Path(tempfile.mktemp(suffix=".jpg", prefix="aitg_avatar_"))
+            path = await ctx.tg.download_profile_photo(entity, file=str(tmp))
+            if path and pathlib.Path(path).exists():
+                data = pathlib.Path(path).read_bytes()
+                b64 = _b64.b64encode(data).decode()
+                ctx.pending_vision.append(f"data:image/jpeg;base64,{b64}")
+                ctx.pending_images.append(path)
+                profile["avatar"] = "изображение передано модели для анализа"
+            else:
+                profile["avatar"] = "нет фото"
         except Exception as e:
-            log.warning("failed to get avatar for %s: %s", user_id, e)
-
-        if avatar_b64:
-            profile["avatar_base64"] = avatar_b64
+            log.warning("failed to get avatar for %s: %s", user_id_or_username, e)
+            profile["avatar"] = f"ошибка: {e}"
 
         return profile
 
@@ -679,6 +687,63 @@ def memory_forget(key: str, scope: str = "chat") -> str:
     return "ok" if memory.forget(key, chat_id=ctx.chat_id, glob=glob) else "NOT_FOUND"
 
 
+def set_reminder(text: str, minutes: int | None = None, at: str | None = None) -> str:
+    """Ставит напоминание. minutes=N — через N минут от сейчас. at='YYYY-MM-DDTHH:MM' — в конкретное время UTC (используй UTC время из системного промпта). Возвращает подтверждение с временем."""
+    ctx = _ctx_get()
+    now = int(time.time())
+    if minutes is not None:
+        fire_at = now + int(minutes) * 60
+    elif at is not None:
+        import datetime as _dt
+        try:
+            dt = _dt.datetime.fromisoformat(str(at).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            fire_at = int(dt.timestamp())
+        except Exception as e:
+            return f"ERROR: неверный формат времени: {e}"
+    else:
+        return "ERROR: укажи minutes или at"
+    if fire_at <= now:
+        return "ERROR: время напоминания уже прошло"
+    user_id = ctx.trigger_msg.sender_id if ctx.trigger_msg else ctx.owner_id
+    reminder_id = memory.add_reminder(ctx.chat_id, user_id, text, fire_at)
+    import datetime as _dt
+    fire_dt = _dt.datetime.fromtimestamp(fire_at, tz=_dt.timezone.utc)
+    local_h = (fire_dt.hour + 5) % 24
+    return f"ok, напомню в {local_h:02d}:{fire_dt.minute:02d} (id={reminder_id})"
+
+
+def list_reminders_tool() -> str:
+    """Показывает все активные напоминания в текущем чате."""
+    ctx = _ctx_get()
+    items = memory.list_reminders(ctx.chat_id)
+    if not items:
+        return "нет активных напоминаний"
+    import datetime as _dt
+    result = []
+    for r in items:
+        dt = _dt.datetime.fromtimestamp(r["fire_at"], tz=_dt.timezone.utc)
+        local_h = (dt.hour + 5) % 24
+        result.append({"id": r["id"], "text": r["text"], "time": f"{dt.strftime('%Y-%m-%d')} {local_h:02d}:{dt.minute:02d}"})
+    return json.dumps(result, ensure_ascii=False)
+
+
+def cancel_reminder(reminder_id: int) -> str:
+    """Отменяет напоминание по его id."""
+    ctx = _ctx_get()
+    ok = memory.cancel_reminder(int(reminder_id), ctx.chat_id)
+    return "отменено" if ok else "NOT_FOUND"
+
+
+def search_log(query: str, all_chats: bool = False, limit: int = 20) -> str:
+    """Ищет по истории всех разговоров бота. query — слово или фраза. all_chats=true — искать во всех чатах, иначе только в текущем. Возвращает JSON [{role,content,ts}]."""
+    ctx = _ctx_get()
+    chat_id = None if all_chats else ctx.chat_id
+    results = memory.search_log(query, chat_id=chat_id, limit=max(1, min(int(limit), 100)))
+    return json.dumps(results, ensure_ascii=False)
+
+
 ALL_TOOLS = [
     web_search,
     fetch_url,
@@ -701,4 +766,8 @@ ALL_TOOLS = [
     memory_recall,
     memory_list,
     memory_forget,
+    set_reminder,
+    list_reminders_tool,
+    cancel_reminder,
+    search_log,
 ]

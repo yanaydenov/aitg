@@ -50,6 +50,30 @@ def _conn() -> sqlite3.Connection:
             ts      INTEGER NOT NULL
         )"""
     )
+    # лог всех диалогов
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS conversation_log (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id  INTEGER NOT NULL,
+            role     TEXT NOT NULL,
+            content  TEXT NOT NULL,
+            ts       INTEGER NOT NULL
+        )"""
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_log_chat_ts ON conversation_log(chat_id, ts DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_log_ts ON conversation_log(ts DESC)")
+    # напоминания
+    c.execute(
+        """CREATE TABLE IF NOT EXISTS reminders (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id  INTEGER NOT NULL,
+            user_id  INTEGER NOT NULL,
+            text     TEXT NOT NULL,
+            fire_at  INTEGER NOT NULL,
+            done     INTEGER NOT NULL DEFAULT 0
+        )"""
+    )
+    c.execute("CREATE INDEX IF NOT EXISTS idx_reminders_fire ON reminders(fire_at) WHERE done=0")
     # миграция из старой таблицы если существует
     _migrate_old_data(c)
     return c
@@ -201,3 +225,71 @@ def whitelist_list() -> list[int]:
     with _lock, _conn() as c:
         rows = c.execute("SELECT user_id FROM whitelist ORDER BY ts DESC").fetchall()
     return [r[0] for r in rows]
+
+
+def add_reminder(chat_id: int, user_id: int, text: str, fire_at: int) -> int:
+    """Добавляет напоминание. fire_at — unix timestamp UTC."""
+    with _lock, _conn() as c:
+        cur = c.execute(
+            "INSERT INTO reminders(chat_id,user_id,text,fire_at,done) VALUES(?,?,?,?,0)",
+            (chat_id, user_id, text, fire_at),
+        )
+        return cur.lastrowid
+
+
+def get_due_reminders(now: int) -> list[dict]:
+    """Возвращает напоминания которые пора отправить."""
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "SELECT id,chat_id,user_id,text,fire_at FROM reminders WHERE done=0 AND fire_at<=? ORDER BY fire_at",
+            (now,),
+        ).fetchall()
+    return [{"id": r[0], "chat_id": r[1], "user_id": r[2], "text": r[3], "fire_at": r[4]} for r in rows]
+
+
+def mark_reminder_done(reminder_id: int) -> None:
+    with _lock, _conn() as c:
+        c.execute("UPDATE reminders SET done=1 WHERE id=?", (reminder_id,))
+
+
+def list_reminders(chat_id: int) -> list[dict]:
+    with _lock, _conn() as c:
+        rows = c.execute(
+            "SELECT id,text,fire_at FROM reminders WHERE chat_id=? AND done=0 ORDER BY fire_at",
+            (chat_id,),
+        ).fetchall()
+    return [{"id": r[0], "text": r[1], "fire_at": r[2]} for r in rows]
+
+
+def cancel_reminder(reminder_id: int, chat_id: int) -> bool:
+    with _lock, _conn() as c:
+        cur = c.execute("UPDATE reminders SET done=1 WHERE id=? AND chat_id=?", (reminder_id, chat_id))
+    return cur.rowcount > 0
+
+
+def log_message(chat_id: int, role: str, content: str) -> None:
+    """Записывает сообщение в постоянный лог диалогов."""
+    with _lock, _conn() as c:
+        c.execute(
+            "INSERT INTO conversation_log(chat_id,role,content,ts) VALUES(?,?,?,?)",
+            (chat_id, role, content, int(time.time())),
+        )
+
+
+def search_log(query: str, chat_id: int | None = None, limit: int = 20) -> list[dict]:
+    """Ищет по логу диалогов. Возвращает [{chat_id,role,content,ts}]."""
+    q = f"%{query}%"
+    with _lock, _conn() as c:
+        if chat_id is not None:
+            rows = c.execute(
+                "SELECT chat_id,role,content,ts FROM conversation_log "
+                "WHERE chat_id=? AND content LIKE ? ORDER BY ts DESC LIMIT ?",
+                (chat_id, q, limit),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT chat_id,role,content,ts FROM conversation_log "
+                "WHERE content LIKE ? ORDER BY ts DESC LIMIT ?",
+                (q, limit),
+            ).fetchall()
+    return [{"chat_id": r[0], "role": r[1], "content": r[2], "ts": r[3]} for r in rows]

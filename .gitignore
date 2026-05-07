@@ -13,4 +13,5 @@ aitg.db
 # IDE
 .idea/
 .vscode/
+.windsurf/
 *.swp
