@@ -43,6 +43,7 @@ class ToolCtx:
     pending_images: list = None  # type: ignore
     input_images: list = None  # type: ignore
     pending_vision: list = None  # type: ignore  # data URLs для передачи модели как vision
+    pending_stickers: list = None  # type: ignore  # пути к WebP-стикерам для отправки
 
     def __post_init__(self):
         if self.pending_images is None:
@@ -51,6 +52,8 @@ class ToolCtx:
             self.input_images = []
         if self.pending_vision is None:
             self.pending_vision = []
+        if self.pending_stickers is None:
+            self.pending_stickers = []
 
 
 _ctx: contextvars.ContextVar[ToolCtx] = contextvars.ContextVar("aitg_ctx")
@@ -373,7 +376,7 @@ def find_chat(query: str) -> str:
 
 
 def list_all_chats() -> str:
-    """Возвращает список всех чатов/групп/каналов/диалогов владельца. JSON [{id,title,type}]. Используй для поиска чата по названию - модель сама выберет подходящий."""
+    """Возвращает список всех чатов/групп/каналов. JSON [{id,title,type,last_msg,unread}]. last_msg — последнее сообщение (для определения тематики канала по содержимому). Используй для поиска нужных чатов когда не знаешь ключевых слов."""
     ctx = _ctx_get()
 
     async def _run():
@@ -381,7 +384,16 @@ def list_all_chats() -> str:
         chats = []
         async for d in ctx.tg.iter_dialogs(limit=400):
             kind = "channel" if d.is_channel else ("group" if d.is_group else "user")
-            chats.append({"id": d.id, "title": d.name or "", "type": kind})
+            last_msg = ""
+            if d.message and hasattr(d.message, "message"):
+                last_msg = (d.message.message or "")[:120]
+            chats.append({
+                "id": d.id,
+                "title": d.name or "",
+                "type": kind,
+                "unread": d.unread_count,
+                "last_msg": last_msg,
+            })
         log.info("list_all_chats: got %d chats", len(chats))
         return chats
 
@@ -391,6 +403,74 @@ def list_all_chats() -> str:
     except Exception as e:
         fut.cancel()
         return f"ERROR list_all_chats: {type(e).__name__}: {e}"
+    return json.dumps(res, ensure_ascii=False)
+
+
+def list_channels() -> str:
+    """Возвращает ВСЕ каналы (только type=channel, без личек и групп) с последним сообщением. JSON [{id,title,last_msg,unread}]. Используй когда нужно найти все каналы определённой тематики — модель сама определит нужные по названию и содержимому."""
+    ctx = _ctx_get()
+
+    async def _run():
+        channels = []
+        async for d in ctx.tg.iter_dialogs(limit=400):
+            if not d.is_channel:
+                continue
+            last_msg = ""
+            if d.message and hasattr(d.message, "message"):
+                last_msg = (d.message.message or "")[:150]
+            channels.append({
+                "id": d.id,
+                "title": d.name or "",
+                "unread": d.unread_count,
+                "last_msg": last_msg,
+            })
+        return channels
+
+    fut = asyncio.run_coroutine_threadsafe(_run(), ctx.loop)
+    try:
+        res = fut.result(timeout=60)
+    except Exception as e:
+        fut.cancel()
+        return f"ERROR list_channels: {type(e).__name__}: {e}"
+    return json.dumps(res, ensure_ascii=False)
+
+
+def search_chats(query: str) -> str:
+    """Ищет чаты/каналы/группы по ключевым словам — в названии И в тексте последнего сообщения. Возвращает [{id,title,type,unread,last_msg}] отсортированные по релевантности. Используй для поиска тематических каналов: 'новости', 'крипта', 'спорт', 'работа' и т.п. — даже если слово не в названии."""
+    ctx = _ctx_get()
+    words = [w.strip().lower() for w in query.strip().split() if w.strip()]
+
+    async def _run():
+        scored = []
+        async for d in ctx.tg.iter_dialogs(limit=400):
+            title = (d.name or "").lower()
+            last_msg = ""
+            if d.message and hasattr(d.message, "message"):
+                last_msg = (d.message.message or "").lower()
+            combined = title + " " + last_msg
+            score = sum(1 for w in words if w in combined)
+            # название важнее — даём двойной вес
+            score += sum(1 for w in words if w in title)
+            if score > 0:
+                kind = "channel" if d.is_channel else ("group" if d.is_group else "user")
+                scored.append((score, {
+                    "id": d.id,
+                    "title": d.name or "",
+                    "type": kind,
+                    "unread": d.unread_count,
+                    "last_msg": (d.message.message or "")[:120] if d.message and hasattr(d.message, "message") else "",
+                }))
+        scored.sort(key=lambda x: -x[0])
+        return [item for _, item in scored]
+
+    fut = asyncio.run_coroutine_threadsafe(_run(), ctx.loop)
+    try:
+        res = fut.result(timeout=60)
+    except Exception as e:
+        fut.cancel()
+        return f"ERROR search_chats: {type(e).__name__}: {e}"
+    if not res:
+        return f"[]  # ничего не найдено по '{query}' — попробуй list_all_chats и выбери сам"
     return json.dumps(res, ensure_ascii=False)
 
 
@@ -736,6 +816,101 @@ def cancel_reminder(reminder_id: int) -> str:
     return "отменено" if ok else "NOT_FOUND"
 
 
+def run_code(code: str) -> str:
+    """Выполняет Python-код и возвращает вывод. Только для владельца. Используй для вычислений, обработки данных, скриптов."""
+    ctx = _ctx_get()
+    if not ctx.is_owner:
+        return "ERROR: только для владельца"
+    import io, contextlib, traceback as _tb
+    stdout = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            exec(code, {"__builtins__": __builtins__, "json": json, "time": time})
+        out = stdout.getvalue()
+        return out.strip()[:4000] if out.strip() else "(нет вывода)"
+    except Exception:
+        return f"ERROR:\n{_tb.format_exc()[:2000]}"
+
+
+def youtube_transcript(url: str) -> str:
+    """Получает транскрипт YouTube-видео по ссылке. Возвращает текст субтитров (авто или ручные). Используй для саммари видео."""
+    try:
+        import re as _re
+        from youtube_transcript_api import YouTubeTranscriptApi
+        vid_match = _re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})", url)
+        if not vid_match:
+            return "ERROR: не удалось извлечь video_id из ссылки"
+        vid_id = vid_match.group(1)
+        transcript = YouTubeTranscriptApi.get_transcript(vid_id, languages=["ru", "en", "uk"])
+        text = " ".join(t["text"] for t in transcript)
+        return text[:12000]
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def translate(text: str, to_lang: str = "ru") -> str:
+    """Переводит текст на указанный язык. to_lang: 'ru'=русский, 'en'=английский, 'de'=немецкий и т.д. Возвращает переведённый текст."""
+    import os as _os
+    from openai import OpenAI as _OAI
+    client = _OAI(
+        api_key=_os.getenv("OPENROUTER_API_KEY"),
+        base_url="https://openrouter.ai/api/v1",
+    )
+    resp = client.chat.completions.create(
+        model=_os.getenv("MODEL", "google/gemini-2.5-flash-preview"),
+        messages=[{"role": "user", "content": f"Переведи на язык '{to_lang}'. СТРОГО сохрани стиль, тон, сленг, мат, эмодзи и пунктуацию оригинала — если оригинал неформальный, перевод тоже должен быть неформальным. Верни ТОЛЬКО перевод, без пояснений:\n\n{text}"}],
+        max_tokens=2000,
+    )
+    return resp.choices[0].message.content or ""
+
+
+def _img_to_sticker(src_path: str, ctx) -> str:
+    """Вспомогательная: конвертирует файл изображения в WebP-стикер 512x512."""
+    import pathlib
+    from PIL import Image
+    src = pathlib.Path(src_path)
+    img = Image.open(src).convert("RGBA")
+    img.thumbnail((512, 512), Image.LANCZOS)
+    sticker_path = src.with_suffix(".webp")
+    img.save(sticker_path, "WEBP")
+    ctx.pending_stickers.append(str(sticker_path))
+    src.unlink(missing_ok=True)
+    return "ok, стикер готов"
+
+
+def generate_sticker(prompt: str = "") -> str:
+    """Создаёт стикер (512x512 WebP). Если пользователь прислал/реплайнул фото — конвертирует его в стикер. Если нет фото — генерирует по описанию prompt. Используй когда просят 'создай стикер', 'сделай стикер из этого фото'."""
+    ctx = _ctx_get()
+    import tempfile, pathlib, base64 as _b64
+    # если есть входное изображение — конвертируем его, не генерируем
+    if ctx.input_images:
+        data_url = ctx.input_images[0]
+        try:
+            from PIL import Image
+            import io
+            if "base64," in data_url:
+                raw = _b64.b64decode(data_url.split("base64,")[1])
+            else:
+                raw = _b64.b64decode(data_url)
+            tmp = pathlib.Path(tempfile.mktemp(suffix=".jpg", prefix="aitg_sticker_"))
+            tmp.write_bytes(raw)
+            return _img_to_sticker(str(tmp), ctx)
+        except Exception as e:
+            return f"ERROR конвертации фото в стикер: {e}"
+    # нет фото — генерируем по промпту
+    if not prompt:
+        return "ERROR: укажи описание стикера или прикрепи фото"
+    result = generate_image(prompt)
+    if result.startswith("ERROR") or not ctx.pending_images:
+        return result
+    src = pathlib.Path(ctx.pending_images.pop())
+    try:
+        return _img_to_sticker(str(src), ctx)
+    except Exception as e:
+        ctx.pending_images.append(str(src))
+        return f"ERROR конвертации стикера: {e}"
+
+
 def search_log(query: str, all_chats: bool = False, limit: int = 20) -> str:
     """Ищет по истории всех разговоров бота. query — слово или фраза. all_chats=true — искать во всех чатах, иначе только в текущем. Возвращает JSON [{role,content,ts}]."""
     ctx = _ctx_get()
@@ -753,6 +928,8 @@ ALL_TOOLS = [
     read_chat_history,
     read_link_preview,
     list_all_chats,
+    list_channels,
+    search_chats,
     find_chat,
     search_messages,
     read_other_chat,
@@ -769,5 +946,9 @@ ALL_TOOLS = [
     set_reminder,
     list_reminders_tool,
     cancel_reminder,
+    run_code,
+    youtube_transcript,
+    translate,
+    generate_sticker,
     search_log,
 ]

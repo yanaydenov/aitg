@@ -200,6 +200,23 @@ async def on_ai(event: events.NewMessage.Event):
         except Exception as e:
             log.error("respond chunk failed: %s", e)
 
+    # отправляем стикеры если есть
+    for path in ctx.pending_stickers:
+        try:
+            from telethon.tl.types import DocumentAttributeSticker, InputStickerSetEmpty
+            await tg.send_file(
+                event.chat_id, path,
+                attributes=[DocumentAttributeSticker(alt="", stickerset=InputStickerSetEmpty())],
+            )
+            log.info("sent sticker %s", path)
+        except Exception as e:
+            log.error("send_sticker failed: %s", e)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
     # отправляем сгенерированные картинки если есть
     for path in ctx.pending_images:
         try:

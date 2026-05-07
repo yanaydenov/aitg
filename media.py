@@ -90,5 +90,28 @@ async def message_to_image_parts(msg: Message) -> list[dict]:
         if mp3:
             b = base64.b64encode(mp3.read_bytes()).decode()
             return [{"type": "input_audio", "input_audio": {"data": b, "format": "mp3"}}]
-    # неизвестный тип — игнорим
+    # документы — извлекаем текст
+    text = _extract_document_text(p, mime)
+    if text:
+        return [{"type": "text", "text": f"[Содержимое документа {p.name}]:\n{text}"}]
     return []
+
+
+def _extract_document_text(p: Path, mime: str) -> str:
+    """Извлекает текст из PDF, DOCX, TXT и других документов."""
+    suffix = p.suffix.lower()
+    try:
+        if suffix == ".pdf" or mime == "application/pdf":
+            from pdfminer.high_level import extract_text as pdf_extract
+            text = pdf_extract(str(p))
+            return (text or "").strip()[:20000]
+        if suffix == ".docx" or mime == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            from docx import Document
+            doc = Document(str(p))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text)
+            return text.strip()[:20000]
+        if suffix in {".txt", ".md", ".csv", ".json", ".xml", ".html", ".htm"} or mime and mime.startswith("text/"):
+            return p.read_text(errors="replace").strip()[:20000]
+    except Exception:
+        pass
+    return ""
