@@ -884,7 +884,12 @@ def generate_sticker(prompt: str = "") -> str:
     import tempfile, pathlib, base64 as _b64
     # если есть входное изображение — конвертируем его, не генерируем
     if ctx.input_images:
-        data_url = ctx.input_images[0]
+        raw_entry = ctx.input_images[0]
+        # input_images хранит OpenAI content parts — извлекаем data URL
+        if isinstance(raw_entry, dict):
+            data_url = raw_entry.get("image_url", {}).get("url", "") or raw_entry.get("url", "")
+        else:
+            data_url = raw_entry
         try:
             from PIL import Image
             import io
