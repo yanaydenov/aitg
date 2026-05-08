@@ -286,8 +286,18 @@ def _run_sync(
             memory.log_message(ctx.chat_id, "assistant", final)
             return final
 
-        # добавляем ответ модели в историю
-        messages.append(msg)
+        # добавляем ответ модели в историю (без thinking-частей — Gemini отклоняет устаревшие сигнатуры)
+        assistant_dict: dict = {"role": "assistant"}
+        if msg.tool_calls:
+            assistant_dict["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+        if msg.content:
+            if isinstance(msg.content, list):
+                clean = [p for p in msg.content if isinstance(p, dict) and p.get("type") != "thinking"]
+                if clean:
+                    assistant_dict["content"] = clean
+            else:
+                assistant_dict["content"] = msg.content
+        messages.append(assistant_dict)
 
         # выполняем все tool_calls
         vision_before = len(ctx.pending_vision)
