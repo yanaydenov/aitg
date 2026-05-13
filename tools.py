@@ -45,6 +45,8 @@ class ToolCtx:
     input_images: list = None  # type: ignore
     pending_vision: list = None  # type: ignore  # data URLs для передачи модели как vision
     pending_stickers: list = None  # type: ignore  # пути к WebP-стикерам для отправки
+    flags: dict = None  # type: ignore  # CLI-флаги запроса: cost/debug/model/temp/no_style/no_tools
+    stats: dict = None  # type: ignore  # статистика выполнения: tokens, cost, tool_calls, duration_ms
 
     def __post_init__(self):
         if self.pending_images is None:
@@ -55,6 +57,10 @@ class ToolCtx:
             self.pending_vision = []
         if self.pending_stickers is None:
             self.pending_stickers = []
+        if self.flags is None:
+            self.flags = {}
+        if self.stats is None:
+            self.stats = {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0, "tool_calls": [], "duration_ms": 0}
 
 
 _ctx: contextvars.ContextVar[ToolCtx] = contextvars.ContextVar("aitg_ctx")

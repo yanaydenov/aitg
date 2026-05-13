@@ -32,6 +32,52 @@ agent_lock = asyncio.Lock()
 _bot_enabled = True
 
 
+_HELP_TEXT = (
+    "флаги `.ai`:\n"
+    "  -c / --cost      — токены и стоимость\n"
+    "  -d / --debug     — список тулов и время\n"
+    "  -m <model>       — модель на запрос (--model)\n"
+    "  -t <0-2>         — температура (--temp)\n"
+    "  --no-style       — без STYLE_PROMPT\n"
+    "  --no-tools       — без вызова тулов\n"
+    "  -h / --help      — этот список\n"
+    "пример: .ai -c -d какие новости"
+)
+
+
+def _parse_flags(text: str) -> tuple[str, dict]:
+    """Извлекает CLI-флаги из текста запроса. Возвращает (clean_text, flags_dict)."""
+    flags: dict = {}
+    parts = text.split()
+    clean: list[str] = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        if p in ("-c", "--cost"):
+            flags["cost"] = True
+        elif p in ("-d", "--debug"):
+            flags["debug"] = True
+        elif p in ("--no-tools",):
+            flags["no_tools"] = True
+        elif p in ("--no-style", "--raw"):
+            flags["no_style"] = True
+        elif p in ("-h", "--help"):
+            flags["help"] = True
+        elif p in ("-m", "--model") and i + 1 < len(parts):
+            flags["model"] = parts[i + 1]
+            i += 1
+        elif p in ("-t", "--temp") and i + 1 < len(parts):
+            try:
+                flags["temp"] = max(0.0, min(2.0, float(parts[i + 1])))
+            except ValueError:
+                pass
+            i += 1
+        else:
+            clean.append(p)
+        i += 1
+    return " ".join(clean).strip(), flags
+
+
 @tg.on(events.NewMessage(pattern=r"(?is)^\s*\.stop\s*$"))
 async def on_stop(event: events.NewMessage.Event):
     global _bot_enabled
@@ -92,8 +138,17 @@ async def on_ai(event: events.NewMessage.Event):
         return
 
     msg = event.message
-    text = (event.pattern_match.group(2) or "").strip()
-    log.info("on_ai: chat=%s msg_id=%s text=%r", event.chat_id, msg.id, text[:80])
+    raw_text = (event.pattern_match.group(2) or "").strip()
+    text, flags = _parse_flags(raw_text)
+    log.info("on_ai: chat=%s msg_id=%s text=%r flags=%s", event.chat_id, msg.id, text[:80], flags)
+
+    # --help — отдаём список флагов и выходим
+    if flags.get("help"):
+        try:
+            await msg.edit(f"<pre>{_HELP_TEXT}</pre>", parse_mode="html")
+        except Exception:
+            await event.respond(f"<pre>{_HELP_TEXT}</pre>", parse_mode="html")
+        return
 
     # для whitelist пользователей не редактируем сообщение - сразу отвечаем
     should_edit = not is_whitelisted
@@ -137,6 +192,7 @@ async def on_ai(event: events.NewMessage.Event):
         trigger_msg=msg,
         loop=asyncio.get_running_loop(),
         input_images=list(image_parts),
+        flags=flags,
     )
 
     # редактируем своё сообщение: показываем "⏳ думаю..." с query в blockquote
@@ -167,6 +223,24 @@ async def on_ai(event: events.NewMessage.Event):
 
     # вставляем ответ под исходным запросом в том же сообщении
     answer = (answer or "").strip() or "(пусто)"
+
+    # CLI-флаги: добавляем footer со статистикой
+    footer_lines = []
+    if flags.get("cost"):
+        s = ctx.stats
+        pt, ct = s.get("prompt_tokens", 0), s.get("completion_tokens", 0)
+        cost = s.get("cost", 0.0)
+        cost_str = f"${cost:.5f}" if cost else "n/a"
+        footer_lines.append(f"💰 {pt}+{ct}={pt+ct} ток · {cost_str}")
+    if flags.get("debug"):
+        s = ctx.stats
+        dur = s.get("duration_ms", 0)
+        calls = s.get("tool_calls", [])
+        footer_lines.append(f"⏱ {dur}ms · {len(calls)} тулов")
+        for tc in calls[:15]:
+            footer_lines.append(f"  • {tc.get('name')}({tc.get('args_preview','')}) {tc.get('duration_ms',0)}ms")
+    if footer_lines:
+        answer = answer + "\n\n" + "─" * 20 + "\n" + "\n".join(footer_lines)
 
     import html as _html
     def _fmt(header_text: str, body: str) -> str:

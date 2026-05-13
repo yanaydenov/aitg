@@ -82,7 +82,7 @@ def _oa_tools() -> list[dict]:
     return _OA_TOOLS
 
 
-def _system_prompt(ctx: tools.ToolCtx) -> str:
+def _system_prompt(ctx: tools.ToolCtx, skip_style: bool = False) -> str:
     chat_mem = memory.list_keys(chat_id=ctx.chat_id, glob=False)
     glob_mem = memory.list_keys(glob=True) if ctx.is_owner else []
     parts = [
@@ -117,9 +117,10 @@ def _system_prompt(ctx: tools.ToolCtx) -> str:
         saved = memory.list_user_info(sid)
         saved_pairs = ("; ".join(f"{k}={v}" for k, v in saved[:10])) if saved else "нет"
         parts.append(f"Текущий собеседник: user_id={sid}. Сохранённые данные: {saved_pairs}. Если говорит 'мои аватарки'/'моё фото' — get_user_profile('{sid}').")
-    style = os.getenv("STYLE_PROMPT", "").strip()
-    if style:
-        parts.append(style)
+    if not skip_style:
+        style = os.getenv("STYLE_PROMPT", "").strip()
+        if style:
+            parts.append(style)
     if chat_mem:
         parts.append("Память этого чата: " + "; ".join(f"{k}={v}" for k, v in chat_mem[:30]))
     if glob_mem:
@@ -207,8 +208,15 @@ def _run_sync(
     image_parts: list[dict],
     ctx: tools.ToolCtx,
 ) -> str:
-    model = os.getenv("MODEL", "google/gemini-2.5-flash")
-    system = _system_prompt(ctx)
+    flags = ctx.flags or {}
+    model = flags.get("model") or os.getenv("MODEL", "google/gemini-2.5-flash")
+    temperature = flags.get("temp", 0.7)
+    no_tools = bool(flags.get("no_tools"))
+    no_style = bool(flags.get("no_style"))
+    system = _system_prompt(ctx, skip_style=no_style)
+
+    import time as _time
+    _start_ts = _time.time()
 
     # строим user-сообщение: текст + картинки, с тегом отправителя
     sender_id = ctx.trigger_msg.sender_id if ctx.trigger_msg else None
@@ -253,14 +261,30 @@ def _run_sync(
     # tool-loop (макс 8 итераций)
     for _ in range(15):
         log.info("calling model: %s (history=%d)", model, len(hist))
-        response = client.chat.completions.create(
+        _req_kwargs = dict(
             model=model,
             messages=messages,
-            tools=_oa_tools(),
-            tool_choice="auto",
-            temperature=0.7,
+            temperature=temperature,
             max_tokens=8192,
+            extra_body={"usage": {"include": True}},
         )
+        if not no_tools:
+            _req_kwargs["tools"] = _oa_tools()
+            _req_kwargs["tool_choice"] = "auto"
+        response = client.chat.completions.create(**_req_kwargs)
+        # копим usage
+        try:
+            u = getattr(response, "usage", None)
+            if u:
+                ctx.stats["prompt_tokens"] += getattr(u, "prompt_tokens", 0) or 0
+                ctx.stats["completion_tokens"] += getattr(u, "completion_tokens", 0) or 0
+                _cost = getattr(u, "cost", None)
+                if _cost is None and hasattr(u, "model_dump"):
+                    _cost = u.model_dump().get("cost")
+                if _cost:
+                    ctx.stats["cost"] += float(_cost)
+        except Exception as _e:
+            log.debug("usage parse failed: %s", _e)
         if not getattr(response, "choices", None):
             err = getattr(response, "error", None) or response.model_dump()
             log.error("empty response from model: %s", str(err)[:500])
@@ -287,6 +311,7 @@ def _run_sync(
             _history[ctx.chat_id].append({"role": "assistant", "content": final})
             memory.log_message(ctx.chat_id, "user", user_log)
             memory.log_message(ctx.chat_id, "assistant", final)
+            ctx.stats["duration_ms"] = int((_time.time() - _start_ts) * 1000)
             return final
 
         # добавляем ответ модели в историю (без thinking-частей — Gemini отклоняет устаревшие сигнатуры)
@@ -307,7 +332,11 @@ def _run_sync(
         for tc in msg.tool_calls:
             args = json.loads(tc.function.arguments or "{}")
             log.info("tool %s(%s) calling...", tc.function.name, args)
+            _t0 = _time.time()
             result = _call_tool(tc.function.name, args)
+            _t_ms = int((_time.time() - _t0) * 1000)
+            _args_preview = ", ".join(f"{k}={str(v)[:30]}" for k, v in list(args.items())[:3])
+            ctx.stats["tool_calls"].append({"name": tc.function.name, "args_preview": _args_preview, "duration_ms": _t_ms})
             if result.startswith("ERROR"):
                 log.warning("tool %s -> %s", tc.function.name, result[:500])
             else:
@@ -326,4 +355,5 @@ def _run_sync(
                 vision_parts.append({"type": "image_url", "image_url": {"url": url}})
             messages.append({"role": "user", "content": vision_parts})
 
+    ctx.stats["duration_ms"] = int((_time.time() - _start_ts) * 1000)
     return "(превышен лимит итераций tool-loop)"
