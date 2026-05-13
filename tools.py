@@ -152,6 +152,58 @@ def download_post(url: str) -> str:
         return f"ERROR download_post: {e}"
 
 
+def download_video(url: str) -> str:
+    """Скачивает видео с YouTube, TikTok, Instagram, Twitter/X, VK и других платформ (через yt-dlp). Файл отправится в чат. Возвращает JSON с title/duration/uploader/size_mb."""
+    ctx = _ctx_get()
+    try:
+        import yt_dlp  # type: ignore
+    except ImportError:
+        return "ERROR: yt-dlp не установлен. pip install yt-dlp"
+
+    out_tmpl = os.path.join(tempfile.gettempdir(), f"aitg_vid_{int(time.time()*1000)}.%(ext)s")
+    # Telegram userbot лимит 2GB. Берём лучшее mp4 до 1.8GB
+    opts = {
+        "outtmpl": out_tmpl,
+        "format": "best[ext=mp4][filesize<1800M]/best[filesize<1800M]/best",
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "max_filesize": 1_800_000_000,
+        "merge_output_format": "mp4",
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
+    except Exception as e:
+        return f"ERROR download_video: {type(e).__name__}: {str(e)[:300]}"
+
+    if not file_path or not os.path.exists(file_path):
+        # yt-dlp иногда меняет расширение после merge
+        base, _ = os.path.splitext(file_path or out_tmpl)
+        for ext in (".mp4", ".mkv", ".webm", ".mov"):
+            candidate = base + ext
+            if os.path.exists(candidate):
+                file_path = candidate
+                break
+    if not file_path or not os.path.exists(file_path):
+        return "ERROR: файл не создан"
+
+    size_mb = round(os.path.getsize(file_path) / 1024 / 1024, 1)
+    if size_mb > 1900:
+        os.remove(file_path)
+        return f"ERROR: видео слишком большое ({size_mb}MB > 1900MB)"
+
+    ctx.pending_images.append(file_path)
+    return json.dumps({
+        "title": (info.get("title") or "")[:200],
+        "duration": info.get("duration"),
+        "uploader": info.get("uploader") or info.get("channel"),
+        "size_mb": size_mb,
+        "platform": info.get("extractor_key"),
+    }, ensure_ascii=False)
+
+
 def image_search(query: str, count: int = 3) -> str:
     """Ищет картинки в интернете через DuckDuckGo и отправляет найденные изображения в чат. count — сколько картинок отправить (1-6). Используй когда просят 'найди картинку', 'покажи фото', 'найди изображение чего-то'."""
     ctx = _ctx_get()
@@ -1044,6 +1096,7 @@ ALL_TOOLS = [
     web_search,
     image_search,
     download_post,
+    download_video,
     fetch_url,
     weather,
     fx_rate,

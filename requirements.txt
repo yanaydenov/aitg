@@ -8,3 +8,4 @@ pdfminer.six>=20221105
 python-docx>=1.1
 youtube-transcript-api>=0.6
 Pillow>=10.0
+yt-dlp>=2024.10.7
