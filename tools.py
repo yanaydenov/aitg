@@ -85,6 +85,67 @@ def web_search(query: str, max_results: int = 5) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+def download_post(url: str) -> str:
+    """Скачивает пост из Telegram по ссылке (t.me/channel/123, t.me/c/12345/678 для приватных). Возвращает текст поста и отправляет все медиа (фото/видео/голос/документы) в текущий чат. Работает с приватными каналами если ты в них."""
+    ctx = _ctx_get()
+    import re as _re
+    m = _re.match(r"https?://t\.me/(c/)?([^/?#]+)/(\d+)", url.strip())
+    if not m:
+        return "ERROR: не похоже на ссылку t.me/<channel>/<msg_id>"
+    is_private = bool(m.group(1))
+    channel_part = m.group(2)
+    msg_id = int(m.group(3))
+
+    async def _run():
+        from telethon.tl.types import PeerChannel
+        try:
+            if is_private:
+                peer = PeerChannel(int(channel_part))
+            else:
+                peer = channel_part
+            msg = await ctx.tg.get_messages(peer, ids=msg_id)
+            if not msg:
+                return "ERROR: сообщение не найдено или нет доступа к каналу"
+
+            text = msg.text or msg.message or ""
+            media_paths = []
+            if msg.media:
+                tmp_dir = tempfile.gettempdir()
+                file_path = await msg.download_media(file=os.path.join(tmp_dir, f"aitg_post_{msg_id}_"))
+                if file_path:
+                    media_paths.append(file_path)
+                    ctx.pending_images.append(file_path)
+
+            # пост может быть частью альбома (grouped_id) — подгружаем соседние
+            if getattr(msg, "grouped_id", None):
+                try:
+                    siblings = await ctx.tg.get_messages(peer, min_id=msg_id - 10, max_id=msg_id + 10)
+                    for s in siblings:
+                        if s and s.id != msg_id and getattr(s, "grouped_id", None) == msg.grouped_id and s.media:
+                            file_path = await s.download_media(file=os.path.join(tempfile.gettempdir(), f"aitg_post_{s.id}_"))
+                            if file_path:
+                                media_paths.append(file_path)
+                                ctx.pending_images.append(file_path)
+                except Exception as e:
+                    log.warning("download_post album fetch failed: %s", e)
+
+            return json.dumps({
+                "text": text[:4000],
+                "media_count": len(media_paths),
+                "from_chat": getattr(msg.chat, "title", None) or channel_part,
+                "date": msg.date.isoformat() if msg.date else None,
+            }, ensure_ascii=False)
+        except Exception as e:
+            return f"ERROR download_post: {type(e).__name__}: {e}"
+
+    fut = asyncio.run_coroutine_threadsafe(_run(), ctx.loop)
+    try:
+        return fut.result(timeout=60)
+    except Exception as e:
+        fut.cancel()
+        return f"ERROR download_post: {e}"
+
+
 def image_search(query: str, count: int = 3) -> str:
     """Ищет картинки в интернете через DuckDuckGo и отправляет найденные изображения в чат. count — сколько картинок отправить (1-6). Используй когда просят 'найди картинку', 'покажи фото', 'найди изображение чего-то'."""
     ctx = _ctx_get()
@@ -976,6 +1037,7 @@ def search_log(query: str, all_chats: bool = False, limit: int = 20) -> str:
 ALL_TOOLS = [
     web_search,
     image_search,
+    download_post,
     fetch_url,
     weather,
     fx_rate,
