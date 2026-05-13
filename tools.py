@@ -10,6 +10,7 @@ import contextvars
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -82,6 +83,54 @@ def web_search(query: str, max_results: int = 5) -> str:
         for r in results
     ]
     return json.dumps(out, ensure_ascii=False)
+
+
+def image_search(query: str, count: int = 3) -> str:
+    """Ищет картинки в интернете через DuckDuckGo и отправляет найденные изображения в чат. count — сколько картинок отправить (1-6). Используй когда просят 'найди картинку', 'покажи фото', 'найди изображение чего-то'."""
+    ctx = _ctx_get()
+    count = max(1, min(int(count), 6))
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query, max_results=count * 2))
+    except Exception as e:
+        return f"ERROR image_search: {e}"
+    if not results:
+        return "ничего не найдено"
+
+    sent = []
+    for r in results:
+        if len(sent) >= count:
+            break
+        url = r.get("image") or r.get("url")
+        if not url:
+            continue
+        try:
+            with httpx.Client(timeout=15, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 aitg"}) as c:
+                resp = c.get(url)
+                if resp.status_code != 200 or not resp.content:
+                    continue
+                ctype = resp.headers.get("content-type", "")
+                if not ctype.startswith("image/"):
+                    continue
+                ext = ".jpg"
+                if "png" in ctype:
+                    ext = ".png"
+                elif "webp" in ctype:
+                    ext = ".webp"
+                elif "gif" in ctype:
+                    ext = ".gif"
+                path = os.path.join(tempfile.gettempdir(), f"aitg_imgsearch_{int(time.time()*1000)}_{len(sent)}{ext}")
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                ctx.pending_images.append(path)
+                sent.append({"title": r.get("title"), "source": r.get("source"), "url": url})
+        except Exception as e:
+            log.warning("image_search download failed for %s: %s", url, e)
+            continue
+
+    if not sent:
+        return "не удалось скачать ни одну картинку"
+    return json.dumps({"sent": len(sent), "images": sent}, ensure_ascii=False)
 
 
 def fetch_url(url: str, max_chars: int = 6000) -> str:
@@ -926,6 +975,7 @@ def search_log(query: str, all_chats: bool = False, limit: int = 20) -> str:
 
 ALL_TOOLS = [
     web_search,
+    image_search,
     fetch_url,
     weather,
     fx_rate,
